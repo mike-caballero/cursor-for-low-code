@@ -1,22 +1,26 @@
 import asyncio
 import base64
-import os
 import shlex
-import shutil
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import uuid4
-
 from anthropic.types.beta import BetaToolComputerUse20241022Param
+from screeninfo import get_monitors
 
 from .base import BaseAnthropicTool, ToolError, ToolResult
 from .run import run
+import logging
 
 OUTPUT_DIR = "/tmp/outputs"
 
 TYPING_DELAY_MS = 12
 TYPING_GROUP_SIZE = 50
+
+MAC_SCALED_RES_HEIGHT = 662
+MAC_SCALED_RES_WIDTH = 1024
+XGA_RES_HEIGHT = 768
+XGA_RES_WIDTH = 1024
 
 Action = Literal[
     "key",
@@ -37,15 +41,6 @@ class Resolution(TypedDict):
     height: int
 
 
-# sizes above XGA/WXGA are not recommended (see README.md)
-# scale down to one of these targets if ComputerTool._scaling_enabled is set
-MAX_SCALING_TARGETS: dict[str, Resolution] = {
-    "XGA": Resolution(width=1024, height=768),  # 4:3
-    "WXGA": Resolution(width=1280, height=800),  # 16:10
-    "FWXGA": Resolution(width=1366, height=768),  # ~16:9
-}
-
-
 class ScalingSource(StrEnum):
     COMPUTER = "computer"
     API = "api"
@@ -54,12 +49,68 @@ class ScalingSource(StrEnum):
 class ComputerToolOptions(TypedDict):
     display_height_px: int
     display_width_px: int
-    display_number: int | None
 
+def xdotool_to_cliclick_key_mapping(k: str) -> str:
+    # Convert from xdotool naming to cliclick naming
+    mapping = {
+        "Return": "return",
+        "Enter": "return",
+        "Esc": "esc",
+        "Escape": "esc",
+        "Tab": "tab",
+        "Up": "arrow-up",
+        "Down": "arrow-down",
+        "Left": "arrow-left",
+        "Right": "arrow-right",
+        "BackSpace": "delete",
+        "Delete": "fwd-delete",
+        "Home": "home",
+        "End": "end",
+        "Page_Up": "page-up",
+        "Prior": "page-up",
+        "Page_Down": "page-down",
+        "Next": "page-down",
+        # Function keys
+        "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4",
+        "F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8",
+        "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
+        "F13": "f13", "F14": "f14", "F15": "f15", "F16": "f16",
+        # Numpad
+        "KP_0": "num-0", "KP_1": "num-1", "KP_2": "num-2", "KP_3": "num-3",
+        "KP_4": "num-4", "KP_5": "num-5", "KP_6": "num-6", "KP_7": "num-7",
+        "KP_8": "num-8", "KP_9": "num-9",
+        "KP_Add": "num-plus", "KP_Subtract": "num-minus",
+        "KP_Multiply": "num-multiply", "KP_Divide": "num-divide",
+        "KP_Enter": "num-enter",
+        "KP_Equal": "num-equals",
+        # Media, brightness, etc. (XF86 keys)
+        "XF86MonBrightnessDown": "brightness-down",
+        "XF86MonBrightnessUp": "brightness-up",
+        "XF86AudioMute": "mute",
+        "XF86AudioLowerVolume": "volume-down",
+        "XF86AudioRaiseVolume": "volume-up",
+        "XF86AudioPlay": "play-pause",
+        "XF86AudioNext": "play-next",
+        "XF86AudioPrev": "play-previous",
+        "XF86KbdBrightnessDown": "keys-light-down",
+        "XF86KbdBrightnessUp": "keys-light-up",
+    }
+    if k in mapping:
+        return mapping[k]
+    return k.lower()
 
-def chunks(s: str, chunk_size: int) -> list[str]:
-    return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size)]
-
+def xdotool_to_cliclick_modifier_mapping(mod: str) -> str:
+    # Convert from xdotool naming to cliclick
+    m = mod.lower()
+    if m in ["ctrl", "control"]:
+        return "ctrl"
+    elif m in ["alt", "option"]:
+        return "alt"
+    elif m in ["super", "cmd", "command"]:
+        return "cmd"
+    elif m == "shift":
+        return "shift"
+    return m
 
 class ComputerTool(BaseAnthropicTool):
     """
@@ -71,7 +122,6 @@ class ComputerTool(BaseAnthropicTool):
     api_type: Literal["computer_20241022"] = "computer_20241022"
     width: int
     height: int
-    display_num: int | None
 
     _screenshot_delay = 2.0
     _scaling_enabled = True
@@ -84,7 +134,6 @@ class ComputerTool(BaseAnthropicTool):
         return {
             "display_width_px": width,
             "display_height_px": height,
-            "display_number": self.display_num,
         }
 
     def to_params(self) -> BetaToolComputerUse20241022Param:
@@ -93,17 +142,9 @@ class ComputerTool(BaseAnthropicTool):
     def __init__(self):
         super().__init__()
 
-        self.width = int(os.getenv("WIDTH") or 0)
-        self.height = int(os.getenv("HEIGHT") or 0)
-        assert self.width and self.height, "WIDTH, HEIGHT must be set"
-        if (display_num := os.getenv("DISPLAY_NUM")) is not None:
-            self.display_num = int(display_num)
-            self._display_prefix = f"DISPLAY=:{self.display_num} "
-        else:
-            self.display_num = None
-            self._display_prefix = ""
-
-        self.xdotool = f"{self._display_prefix}xdotool"
+        monitor = get_monitors()[0]
+        self.width = monitor.width
+        self.height = monitor.height
 
     async def __call__(
         self,
@@ -128,11 +169,11 @@ class ComputerTool(BaseAnthropicTool):
             )
 
             if action == "mouse_move":
-                return await self.shell(f"{self.xdotool} mousemove --sync {x} {y}")
+                return await self.shell(f"cliclick m:{x},{y}")
             elif action == "left_click_drag":
-                return await self.shell(
-                    f"{self.xdotool} mousedown 1 mousemove --sync {x} {y} mouseup 1"
-                )
+                await self.shell(f"cliclick dd:.")
+                await self.shell(f"cliclick m:{x},{y}")
+                return await self.shell(f"cliclick du:.")
 
         if action in ("key", "type"):
             if text is None:
@@ -143,16 +184,32 @@ class ComputerTool(BaseAnthropicTool):
                 raise ToolError(output=f"{text} must be a string")
 
             if action == "key":
-                return await self.shell(f"{self.xdotool} key -- {text}")
+                logging.info('Key leveraged %s', text)
+                parts = text.split('+')
+                if len(parts) == 1:
+                    # No modifiers, just a single key
+                    key = parts[0]
+                    return await self.shell(f"cliclick kp:{xdotool_to_cliclick_key_mapping(key)}")
+                else:
+                    # Everything but the last item is a modifier, the last is the "main" key
+                    *mods, main_key = parts
+                    mods = [xdotool_to_cliclick_key_mapping(m) for m in mods]
+                    main_key = xdotool_to_cliclick_modifier_mapping(main_key)
+
+                    # Press modifiers
+                    mods_arg = ",".join(mods)
+                    await self.shell(f"cliclick kd:{mods_arg}")
+                    # Press the main key
+                    await self.shell(f"cliclick kp:{main_key}")
+                    # Release modifiers
+                    return await self.shell(f"cliclick ku:{mods_arg}")
+                                
             elif action == "type":
-                results: list[ToolResult] = []
-                for chunk in chunks(text, TYPING_GROUP_SIZE):
-                    cmd = f"{self.xdotool} type --delay {TYPING_DELAY_MS} -- {shlex.quote(chunk)}"
-                    results.append(await self.shell(cmd, take_screenshot=False))
+                result = await self.shell(f'cliclick t:{text}', take_screenshot=False)
                 screenshot_base64 = (await self.screenshot()).base64_image
                 return ToolResult(
-                    output="".join(result.output or "" for result in results),
-                    error="".join(result.error or "" for result in results),
+                    output=result.output,
+                    error=result.error,
                     base64_image=screenshot_base64,
                 )
 
@@ -172,25 +229,26 @@ class ComputerTool(BaseAnthropicTool):
             if action == "screenshot":
                 return await self.screenshot()
             elif action == "cursor_position":
-                result = await self.shell(
-                    f"{self.xdotool} getmouselocation --shell",
-                    take_screenshot=False,
-                )
-                output = result.output or ""
+                result = await self.shell("cliclick p:", take_screenshot=False)
+                output = result.output.strip() or ""
+                x_int, y_int = map(int, output.split(","))
                 x, y = self.scale_coordinates(
                     ScalingSource.COMPUTER,
-                    int(output.split("X=")[1].split("\n")[0]),
-                    int(output.split("Y=")[1].split("\n")[0]),
+                    x_int,
+                    y_int,
                 )
-                return result.replace(output=f"X={x},Y={y}")
+                return result.replace(output=f'X={x},Y={y}')
             else:
+                if action == "middle_click":
+                    logging.error('Middle click leveraged')
+                    return ToolResult(error="Middle click is not supported currently.")
                 click_arg = {
-                    "left_click": "1",
-                    "right_click": "3",
-                    "middle_click": "2",
-                    "double_click": "--repeat 2 --delay 500 1",
+                    "left_click": "c:.",
+                    "right_click": "rc:.",
+                    # "middle_click": "",
+                    "double_click": "dc:.",
                 }[action]
-                return await self.shell(f"{self.xdotool} click {click_arg}")
+                return await self.shell(f"cliclick {click_arg}")
 
         raise ToolError(f"Invalid action: {action}")
 
@@ -200,21 +258,15 @@ class ComputerTool(BaseAnthropicTool):
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"screenshot_{uuid4().hex}.png"
 
-        # Try gnome-screenshot first
-        if shutil.which("gnome-screenshot"):
-            screenshot_cmd = f"{self._display_prefix}gnome-screenshot -f {path} -p"
-        else:
-            # Fall back to scrot if gnome-screenshot isn't available
-            screenshot_cmd = f"{self._display_prefix}scrot -p {path}"
-
-        result = await self.shell(screenshot_cmd, take_screenshot=False)
-        if self._scaling_enabled:
-            x, y = self.scale_coordinates(
-                ScalingSource.COMPUTER, self.width, self.height
-            )
-            await self.shell(
-                f"convert {path} -resize {x}x{y}! {path}", take_screenshot=False
-            )
+        result = await self.shell(f'screencapture -x {path}', take_screenshot=False)
+        await self.shell(
+            f'magick {path} \
+                -resize {MAC_SCALED_RES_WIDTH}x{MAC_SCALED_RES_HEIGHT} \
+                -gravity north \
+                -background black \
+                -extent {XGA_RES_WIDTH}x{XGA_RES_HEIGHT} \
+                {path}', take_screenshot=False
+        )
 
         if path.exists():
             return result.replace(
@@ -225,6 +277,8 @@ class ComputerTool(BaseAnthropicTool):
     async def shell(self, command: str, take_screenshot=True) -> ToolResult:
         """Run a shell command and return the output, error, and optionally a screenshot."""
         _, stdout, stderr = await run(command)
+        if stderr:
+            logging.error('Error from shell command: %s', stderr)
         base64_image = None
 
         if take_screenshot:
@@ -235,26 +289,43 @@ class ComputerTool(BaseAnthropicTool):
         return ToolResult(output=stdout, error=stderr, base64_image=base64_image)
 
     def scale_coordinates(self, source: ScalingSource, x: int, y: int):
-        """Scale coordinates to a target maximum resolution."""
-        if not self._scaling_enabled:
-            return x, y
-        ratio = self.width / self.height
-        target_dimension = None
-        for dimension in MAX_SCALING_TARGETS.values():
-            # allow some error in the aspect ratio - not ratios are exactly 16:9
-            if abs(dimension["width"] / dimension["height"] - ratio) < 0.02:
-                if dimension["width"] < self.width:
-                    target_dimension = dimension
-                break
-        if target_dimension is None:
-            return x, y
-        # should be less than 1
-        x_scaling_factor = target_dimension["width"] / self.width
-        y_scaling_factor = target_dimension["height"] / self.height
+        """Scale coordinates between actual screen resolution and target scaled resolution.
+        Handles conversion between actual Mac resolution (1728x1117), 
+        scaled screenshot (1024x662), and final XGA format (1024x768).
+        
+        When scaling API -> Computer:
+            1. Coordinates come in relative to XGA resolution (1024x768)
+            2. Need to translate to scaled screenshot coordinates (1024x662)
+            3. Then scale up to actual screen coordinates (1728x1117)
+        
+        When scaling Computer -> API:
+            1. Coordinates come in from actual screen (1728x1117)
+            2. Scale down to screenshot size (1024x662)
+            3. Translate to XGA coordinates (1024x768)
+        
+        Args:
+            source: ScalingSource.COMPUTER for scaling down from real screen coordinates
+                ScalingSource.API for scaling up from XGA resolution coordinates
+            x: The x coordinate to scale
+            y: The y coordinate to scale
+            
+        Returns:
+            tuple[int, int]: The scaled (x, y) coordinates
+        """
+        screen_to_scaled_x = MAC_SCALED_RES_WIDTH / self.width
+        screen_to_scaled_y = MAC_SCALED_RES_HEIGHT / self.height
+
         if source == ScalingSource.API:
-            if x > self.width or y > self.height:
-                raise ToolError(f"Coordinates {x}, {y} are out of bounds")
-            # scale up
-            return round(x / x_scaling_factor), round(y / y_scaling_factor)
-        # scale down
-        return round(x * x_scaling_factor), round(y * y_scaling_factor)
+            if x > MAC_SCALED_RES_WIDTH or y > MAC_SCALED_RES_HEIGHT:
+                raise ToolError(f'Coordinates {x}, {y} are out of bounds')
+                
+            actual_x = round(x / screen_to_scaled_x)
+            actual_y = round(y / screen_to_scaled_y)
+            
+            return actual_x, actual_y
+        
+        else:  # ScalingSource.COMPUTER               
+            scaled_x = round(x * screen_to_scaled_x)
+            scaled_y = round(y * screen_to_scaled_y)
+            
+            return scaled_x, scaled_y
