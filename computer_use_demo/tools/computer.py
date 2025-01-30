@@ -50,67 +50,83 @@ class ComputerToolOptions(TypedDict):
     display_height_px: int
     display_width_px: int
 
-def xdotool_to_cliclick_key_mapping(k: str) -> str:
-    # Convert from xdotool naming to cliclick naming
-    mapping = {
-        "Return": "return",
-        "Enter": "return",
-        "Esc": "esc",
-        "Escape": "esc",
-        "Tab": "tab",
-        "Up": "arrow-up",
-        "Down": "arrow-down",
-        "Left": "arrow-left",
-        "Right": "arrow-right",
-        "BackSpace": "delete",
-        "Delete": "fwd-delete",
-        "Home": "home",
-        "End": "end",
-        "Page_Up": "page-up",
-        "Prior": "page-up",
-        "Page_Down": "page-down",
-        "Next": "page-down",
-        # Function keys
-        "F1": "f1", "F2": "f2", "F3": "f3", "F4": "f4",
-        "F5": "f5", "F6": "f6", "F7": "f7", "F8": "f8",
-        "F9": "f9", "F10": "f10", "F11": "f11", "F12": "f12",
-        "F13": "f13", "F14": "f14", "F15": "f15", "F16": "f16",
-        # Numpad
-        "KP_0": "num-0", "KP_1": "num-1", "KP_2": "num-2", "KP_3": "num-3",
-        "KP_4": "num-4", "KP_5": "num-5", "KP_6": "num-6", "KP_7": "num-7",
-        "KP_8": "num-8", "KP_9": "num-9",
-        "KP_Add": "num-plus", "KP_Subtract": "num-minus",
-        "KP_Multiply": "num-multiply", "KP_Divide": "num-divide",
-        "KP_Enter": "num-enter",
-        "KP_Equal": "num-equals",
-        # Media, brightness, etc. (XF86 keys)
-        "XF86MonBrightnessDown": "brightness-down",
-        "XF86MonBrightnessUp": "brightness-up",
-        "XF86AudioMute": "mute",
-        "XF86AudioLowerVolume": "volume-down",
-        "XF86AudioRaiseVolume": "volume-up",
-        "XF86AudioPlay": "play-pause",
-        "XF86AudioNext": "play-next",
-        "XF86AudioPrev": "play-previous",
-        "XF86KbdBrightnessDown": "keys-light-down",
-        "XF86KbdBrightnessUp": "keys-light-up",
-    }
-    if k in mapping:
-        return mapping[k]
-    return k.lower()
+##########################
+# Xdotool-to-AppleScript Mapping
+##########################
+XDOTOOL_TO_APPLESCRIPT_KEYCODES = {
+    # Movement / Arrows
+    "Left": 123,
+    "Right": 124,
+    "Down": 125,
+    "Up": 126,
 
-def xdotool_to_cliclick_modifier_mapping(mod: str) -> str:
-    # Convert from xdotool naming to cliclick
-    m = mod.lower()
-    if m in ["ctrl", "control"]:
-        return "ctrl"
-    elif m in ["alt", "option"]:
-        return "alt"
-    elif m in ["super", "cmd", "command"]:
-        return "cmd"
-    elif m == "shift":
-        return "shift"
-    return m
+    # Special keys
+    "Return": 36,
+    "Enter": 36,
+    "Esc": 53,
+    "Escape": 53,
+    "Tab": 48,
+    "BackSpace": 51,  # macOS calls this 'delete'
+    "Delete": 117,    # forward delete on mac
+    "Home": 115,
+    "End": 119,
+    "Page_Up": 116,
+    "Prior": 116,     # often same as Page_Up
+    "Page_Down": 121,
+    "Next": 121,      # often same as Page_Down
+
+    # Function keys
+    "F1": 122, "F2": 120, "F3": 99,  "F4": 118,
+    "F5": 96,  "F6": 97,  "F7": 98,  "F8": 100,
+    "F9": 101, "F10": 109, "F11": 103, "F12": 111,
+    # (Add more if needed: F13-F16, etc.)
+}
+
+XDOTOOL_TO_APPLESCRIPT_MODIFIERS = {
+    "ctrl":  "control down",
+    "control": "control down",
+    "alt":   "option down",
+    "shift": "shift down",
+    "super": "command down",  # or "cmd" => "command down"
+    "cmd":   "command down",
+    "meta":  "command down",
+}
+
+def press_key_applescript(keycode: int, modifiers: list[str]) -> str:
+    """Return an AppleScript snippet to press a given keycode with optional modifiers."""
+    # Convert your "cmd"/"ctrl"/"alt"/"shift" to AppleScript equivalents:
+    applescript_mods_map = {
+        "cmd": "command down",
+        "ctrl": "control down",
+        "alt": "option down",
+        "shift": "shift down",
+    }
+    # Filter out any modifiers not recognized
+    applescript_mods = [applescript_mods_map[m] for m in modifiers if m in applescript_mods_map]
+    if applescript_mods:
+        mods_str = " using {" + ", ".join(applescript_mods) + "}"
+    else:
+        mods_str = ""
+    
+    return f'tell application "System Events" to key code {keycode}{mods_str}'
+
+def press_character_applescript(char: str, modifiers: list[str]) -> str:
+    """Return an AppleScript snippet to press a character (e.g. 'a') with optional modifiers."""
+    applescript_mods_map = {
+        "cmd": "command down",
+        "ctrl": "control down",
+        "alt": "option down",
+        "shift": "shift down",
+    }
+    applescript_mods = [applescript_mods_map[m] for m in modifiers if m in applescript_mods_map]
+    if applescript_mods:
+        mods_str = " using {" + ", ".join(applescript_mods) + "}"
+    else:
+        mods_str = ""
+    
+    # If char is a double quote, we need to escape it for AppleScript
+    safe_char = char.replace('"', '\\"')
+    return f'tell application "System Events" to keystroke "{safe_char}"{mods_str}'
 
 class ComputerTool(BaseAnthropicTool):
     """
@@ -184,25 +200,33 @@ class ComputerTool(BaseAnthropicTool):
                 raise ToolError(output=f"{text} must be a string")
 
             if action == "key":
-                logging.info('Key leveraged %s', text)
                 parts = text.split('+')
-                if len(parts) == 1:
-                    # No modifiers, just a single key
-                    key = parts[0]
-                    return await self.shell(f"cliclick kp:{xdotool_to_cliclick_key_mapping(key)}")
-                else:
-                    # Everything but the last item is a modifier, the last is the "main" key
-                    *mods, main_key = parts
-                    mods = [xdotool_to_cliclick_key_mapping(m) for m in mods]
-                    main_key = xdotool_to_cliclick_modifier_mapping(main_key)
+                # Last item is the "main" key, the rest are modifiers
+                key = parts[-1]
+                raw_mods = parts[:-1]
 
-                    # Press modifiers
-                    mods_arg = ",".join(mods)
-                    await self.shell(f"cliclick kd:{mods_arg}")
-                    # Press the main key
-                    await self.shell(f"cliclick kp:{main_key}")
-                    # Release modifiers
-                    return await self.shell(f"cliclick ku:{mods_arg}")
+                # Convert xdotool-style modifiers to AppleScript strings
+                applescript_mods = []
+                for m in raw_mods:
+                    if m in XDOTOOL_TO_APPLESCRIPT_MODIFIERS:
+                        applescript_mods.append(XDOTOOL_TO_APPLESCRIPT_MODIFIERS[m])
+                    else:
+                        logging.error(f"Unknown modifier '{m}' - ignoring")
+
+                # Decide if this is a "special key" (arrow, Return, etc.):
+                if key in XDOTOOL_TO_APPLESCRIPT_KEYCODES:
+                    # It's a known special key => use key code
+                    keycode = XDOTOOL_TO_APPLESCRIPT_KEYCODES[key]
+                    applescript_cmd = press_key_applescript(keycode, applescript_mods)
+                else:
+                    # Assume it's a normal character (like 'a', 'b', '1', '-', etc.)
+                    # We'll press it using keystroke
+                    applescript_cmd = press_character_applescript(key, applescript_mods)
+
+                if not applescript_cmd:
+                    raise ToolError(f"Cannot execute key '{text}'. Please try a different method.")
+                
+                return await self.shell(f'osascript -e \'{applescript_cmd}\'')
                                 
             elif action == "type":
                 result = await self.shell(f'cliclick t:{text}', take_screenshot=False)
